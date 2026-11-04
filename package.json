@@ -1,0 +1,14 @@
+{
+  "name": "jk-push",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted native push notification gateway for APNs and FCM",
+  "engines": {"node": ">=22.13.0"},
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/api.js && node --check src/worker.js && node --check src/providers/apns.js && node --check src/providers/fcm.js"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,17 @@
+services:
+  jk_push:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:8787:8787'
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8787
+      - DATABASE_PATH=/app/data/jk_push.sqlite
+      - ADMIN_KEY=${ADMIN_KEY:?Set ADMIN_KEY in .env}
+      - MASTER_KEY=${MASTER_KEY:?Set MASTER_KEY in .env}
+      - MOCK_DELIVERY=${MOCK_DELIVERY:-0}
+    volumes:
+      - jk_push_data:/app/data
+volumes:
+  jk_push_data:

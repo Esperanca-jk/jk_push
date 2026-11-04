@@ -1,0 +1,11 @@
+.env
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+node_modules/
+.DS_Store
+coverage/
+*.p8
+*service-account*.json
