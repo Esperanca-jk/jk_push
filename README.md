@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/cover.svg" alt="JK Push, self-hosted native notifications" width="100%"></p>
+
 # JK Push
 
 **A self-hosted native push notification platform for iOS and Android.** Build an operator console, register devices, target audiences, schedule messages and send through **APNs** and **FCM HTTP v1** — without a per-user or per-message software subscription.
@@ -63,6 +65,16 @@ console.log(queued.messageId);
 ```
 
 Keep `JK_PUSH_SERVER_KEY` on your **trusted backend**, never in mobile applications. Your backend authenticates users, obtains a 10-minute registration ticket, and passes only that ticket to the app. See [Expo registration](examples/expo-registration.md).
+
+### One-command mock walkthrough
+
+Run the complete project → device → notification → receipt flow without provider accounts, permanent storage or external services:
+
+```bash
+npm run demo:mock
+```
+
+The example starts an ephemeral loopback API with in-memory SQLite, registers a **synthetic** Android token and asserts one simulated provider acceptance. It does **not** send a real device notification. [Read the example](examples/mock-walkthrough.mjs) or [its regression test](test/demo.test.js).
 
 ## Enable real native delivery
 

@@ -11,7 +11,8 @@
     "start": "node --env-file-if-exists=.env src/server.js",
     "test": "node --test",
     "check": "node --check src/server.js && node --check src/api.js && node --check src/worker.js && node --check src/providers/apns.js && node --check src/providers/fcm.js && node --check scripts/init.mjs",
-    "init": "node scripts/init.mjs"
+    "init": "node scripts/init.mjs",
+    "demo:mock": "node examples/mock-walkthrough.mjs"
   },
   "license": "MIT"
 }
