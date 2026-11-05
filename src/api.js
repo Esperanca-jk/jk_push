@@ -1,15 +1,14 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createPrivateKey } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { randomKey, digest, encrypt, decrypt, makeRegistrationToken, verifyRegistrationToken, secureEqual } from './crypto.js';
 import { transaction } from './db.js';
-import { ensure, ID, TOPIC, checkDevice, checkMessage } from './validate.js';
+import { ensure, ID, USER_ID, TOPIC, checkDevice, checkMessage } from './validate.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const BEARER = /^Bearer (\S+)$/i;
-const USER_ID = /^[a-zA-Z0-9_.:@-]{1,128}$/;
 function json(res, status, data) {
   const payload = JSON.stringify(data);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(payload),
@@ -58,6 +57,10 @@ function validCredentials(input) {
     ensure(c && /^[A-Z0-9]{10}$/.test(c.teamId ?? '') && /^[A-Z0-9]{10}$/.test(c.keyId ?? '') &&
       /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(c.bundleId ?? '') &&
       typeof c.privateKey === 'string' && c.privateKey.includes('BEGIN PRIVATE KEY'), 'Invalid APNs credential fields');
+    let key;
+    try { key = createPrivateKey(c.privateKey); } catch {}
+    ensure(key?.asymmetricKeyType === 'ec' && key.asymmetricKeyDetails?.namedCurve === 'prime256v1',
+      'APNs privateKey must be a valid P-256 EC private key');
     result.apns = { teamId: c.teamId, keyId: c.keyId, bundleId: c.bundleId, privateKey: c.privateKey };
   }
   if (input.fcm !== undefined) {
@@ -65,6 +68,9 @@ function validCredentials(input) {
     ensure(c && /^[a-z0-9][a-z0-9-]{2,90}$/i.test(c.projectId ?? '') &&
       typeof c.clientEmail === 'string' && c.clientEmail.endsWith('.gserviceaccount.com') &&
       typeof c.privateKey === 'string' && c.privateKey.includes('BEGIN PRIVATE KEY'), 'Invalid FCM credential fields');
+    let key;
+    try { key = createPrivateKey(c.privateKey); } catch {}
+    ensure(key?.asymmetricKeyType === 'rsa', 'FCM privateKey must be a valid RSA private key');
     result.fcm = { projectId: c.projectId, clientEmail: c.clientEmail, privateKey: c.privateKey };
   }
   ensure(Object.keys(result).length > 0, 'Specify apns or fcm credentials');
@@ -79,10 +85,13 @@ export function createApi({ db, adminKey, masterKey, worker, clock = () => Date.
     try {
       const ip = req.socket.remoteAddress ?? 'unknown';
       const bucket = Math.floor(clock() / 60_000);
-      const quota = quotas.get(ip) ?? { bucket, requests: 0 };
+      // Different registration tickets and project keys share the same reverse proxy IP.
+      const principal = tokenFrom(req);
+      const quotaKey = ip + ':' + (principal ? digest(principal).slice(0, 20) : 'anonymous');
+      const quota = quotas.get(quotaKey) ?? { bucket, requests: 0 };
       if (quota.bucket !== bucket) { quota.bucket = bucket; quota.requests = 0; }
       quota.requests++;
-      quotas.set(ip, quota);
+      quotas.set(quotaKey, quota);
       if (quotas.size > 10000) quotas.clear();
       ensure(quota.requests <= 300, 'Too many requests', 429);
       const path = new URL(req.url ?? '/', 'http://localhost').pathname;
@@ -128,6 +137,29 @@ export function createApi({ db, adminKey, masterKey, worker, clock = () => Date.
         db.prepare('UPDATE projects SET credentials=? WHERE id=?').run(encrypt(combined, masterKey), match[1]);
         return json(res, 200, { ok: true, providers: Object.keys(combined) });
       }
+      if (method === 'GET' && (match = /^\/v1\/admin\/projects\/([a-f0-9-]{36})\/providers$/.exec(path))) {
+        requireAdmin(req, adminKey);
+        const project = db.prepare('SELECT credentials FROM projects WHERE id=?').get(match[1]);
+        ensure(project, 'Project not found', 404);
+        const creds = project.credentials ? decrypt(project.credentials, masterKey) : {};
+        return json(res, 200, { apnsConfigured: !!creds.apns, fcmConfigured: !!creds.fcm });
+      }
+      if (method === 'DELETE' && (match = /^\/v1\/admin\/projects\/([a-f0-9-]{36})\/credentials\/(apns|fcm)$/.exec(path))) {
+        requireAdmin(req, adminKey);
+        const project = db.prepare('SELECT credentials FROM projects WHERE id=?').get(match[1]);
+        ensure(project, 'Project not found', 404);
+        const creds = project.credentials ? decrypt(project.credentials, masterKey) : {};
+        delete creds[match[2]];
+        db.prepare('UPDATE projects SET credentials=? WHERE id=?').run(Object.keys(creds).length ? encrypt(creds, masterKey) : null, match[1]);
+        return json(res, 200, { ok: true, apnsConfigured: !!creds.apns, fcmConfigured: !!creds.fcm });
+      }
+      if (method === 'DELETE' && (match = /^\/v1\/admin\/projects\/([a-f0-9-]{36})$/.exec(path))) {
+        requireAdmin(req, adminKey);
+        ensure(req.headers['x-confirm-delete'] === match[1], 'Provide X-Confirm-Delete with the project ID', 400);
+        const removed = db.prepare('DELETE FROM projects WHERE id=?').run(match[1]);
+        ensure(removed.changes === 1, 'Project not found', 404);
+        return json(res, 200, { ok: true, removed: 1 });
+      }
       if (method === 'POST' && (match = /^\/v1\/projects\/([a-f0-9-]{36})\/registration-tokens$/.exec(path))) {
         projectAuth(req, db, match[1]);
         const input = await bodyJson(req);
@@ -137,20 +169,50 @@ export function createApi({ db, adminKey, masterKey, worker, clock = () => Date.
       if (method === 'POST' && (match = /^\/v1\/projects\/([a-f0-9-]{36})\/devices$/.exec(path))) {
         const ticket = clientAuth(req, match[1], masterKey);
         const input = checkDevice(await bodyJson(req));
-        const saved = db.prepare(`INSERT INTO devices(project_id,installation_id,user_id,platform,token_cipher,token_hash,environment,locale,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,installation_id) DO UPDATE SET
-          user_id=excluded.user_id, platform=excluded.platform, token_cipher=excluded.token_cipher,
-          token_hash=excluded.token_hash, environment=excluded.environment, locale=excluded.locale,
-          enabled=1, updated_at=excluded.updated_at
-          WHERE devices.user_id=excluded.user_id`).run(match[1], input.installationId, ticket.userId,
-          input.platform, encrypt(input.token, masterKey), digest(input.token), input.environment, input.locale, clock());
-        ensure(saved.changes === 1, 'Installation belongs to another user', 409);
+        const saved = transaction(db, () => {
+          const tokenHash = digest(input.token);
+          // A native token belongs to one app installation. Prevent stale account registrations
+          // from forwarding another user's targeted messages to a newly signed-in account.
+          const other = db.prepare('SELECT installation_id, user_id FROM devices WHERE project_id=? AND token_hash=? AND installation_id!=?')
+            .get(match[1], tokenHash, input.installationId);
+          ensure(!other || other.user_id === ticket.userId,
+            'Push token is still registered to another user; remove the old registration first', 409);
+          // Duplicate records for the same user/token cause duplicate notifications.
+          if (other) db.prepare('DELETE FROM devices WHERE project_id=? AND installation_id=? AND user_id=?')
+            .run(match[1], other.installation_id, ticket.userId);
+          const upsert = db.prepare(`INSERT INTO devices(project_id,installation_id,user_id,platform,token_cipher,token_hash,environment,locale,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,installation_id) DO UPDATE SET
+            user_id=excluded.user_id, platform=excluded.platform, token_cipher=excluded.token_cipher,
+            token_hash=excluded.token_hash, environment=excluded.environment, locale=excluded.locale,
+            enabled=1, updated_at=excluded.updated_at
+            WHERE devices.user_id=excluded.user_id`).run(match[1], input.installationId, ticket.userId,
+            input.platform, encrypt(input.token, masterKey), tokenHash, input.environment, input.locale, clock());
+          ensure(upsert.changes === 1, 'Installation belongs to another user', 409);
+          return upsert;
+        });
         return json(res, 200, { ok: true, installationId: input.installationId });
       }
       if (method === 'DELETE' && (match = /^\/v1\/projects\/([a-f0-9-]{36})\/devices\/([A-Za-z0-9_-]{1,128})$/.exec(path))) {
         const ticket = clientAuth(req, match[1], masterKey);
         const done = db.prepare('DELETE FROM devices WHERE project_id=? AND installation_id=? AND user_id=?').run(match[1], match[2], ticket.userId);
         return json(res, 200, { ok: true, removed: Number(done.changes) });
+      }
+      if (method === 'GET' && (match = /^\/v1\/projects\/([a-f0-9-]{36})\/devices$/.exec(path))) {
+        projectAuth(req, db, match[1]);
+        const query = new URL(req.url, 'http://localhost').searchParams;
+        const limit = Number(query.get('limit') ?? 50);
+        const after = Number(query.get('after') ?? 0);
+        ensure(Number.isInteger(limit) && limit >= 1 && limit <= 100 && Number.isSafeInteger(after) && after >= 0,
+          'limit must be 1–100 and after must be a non-negative integer');
+        const rows = db.prepare(`SELECT id, installation_id AS installationId, user_id AS userId,
+          platform, environment, locale, enabled, updated_at AS updatedAt
+          FROM devices WHERE project_id=? AND id>? ORDER BY id LIMIT ?`).all(match[1], after, limit + 1);
+        return json(res, 200, { devices: rows.slice(0, limit), nextCursor: rows.length > limit ? rows[limit - 1].id : null });
+      }
+      if (method === 'DELETE' && (match = /^\/v1\/projects\/([a-f0-9-]{36})\/users\/([a-zA-Z0-9_.:@-]{1,128})$/.exec(path))) {
+        projectAuth(req, db, match[1]);
+        const result = db.prepare('DELETE FROM devices WHERE project_id=? AND user_id=?').run(match[1], match[2]);
+        return json(res, 200, { ok: true, removedDevices: Number(result.changes) });
       }
       if (method === 'POST' && (match = /^\/v1\/projects\/([a-f0-9-]{36})\/topics$/.exec(path))) {
         projectAuth(req, db, match[1]);
@@ -167,10 +229,10 @@ export function createApi({ db, adminKey, masterKey, worker, clock = () => Date.
       if (method === 'POST' && (match = /^\/v1\/projects\/([a-f0-9-]{36})\/messages$/.exec(path))) {
         projectAuth(req, db, match[1]);
         const raw = await bodyJson(req);
-        const input = checkMessage(raw);
+        const input = checkMessage(raw, clock());
         const idem = req.headers['idempotency-key'];
         ensure(idem === undefined || (typeof idem === 'string' && /^[A-Za-z0-9_-]{6,128}$/.test(idem)), 'Invalid Idempotency-Key');
-        const requestHash = digest(JSON.stringify({ title: input.title, body: input.body, data: input.data, target: input.target, sendAt: raw.sendAt ?? null }));
+        const requestHash = digest(JSON.stringify({ title: input.title, body: input.body, data: input.data, target: input.target, options: input.options, sendAt: raw.sendAt ?? null }));
         const created = transaction(db, () => {
           if (idem) {
             const existing = db.prepare('SELECT id, request_hash FROM messages WHERE project_id=? AND idempotency_key=?').get(match[1], idem);
@@ -186,12 +248,13 @@ export function createApi({ db, adminKey, masterKey, worker, clock = () => Date.
           if (target.installationIds) { sql += ` AND v.installation_id IN (${target.installationIds.map(() => '?').join(',')})`; args.push(...target.installationIds); }
           if (target.topic) { sql += ' AND EXISTS (SELECT 1 FROM topics t WHERE t.project_id=v.project_id AND t.installation_id=v.installation_id AND t.topic=?)'; args.push(target.topic); }
           if (target.locale) { sql += ' AND v.locale=?'; args.push(target.locale); }
-          sql += ' ORDER BY v.id LIMIT 1001';
+          if (target.platform) { sql += ' AND v.platform=?'; args.push(target.platform); }
+          sql += ' ORDER BY v.id LIMIT 10001';
           const devices = db.prepare(sql).all(...args);
-          ensure(devices.length <= 1000, 'Target too large for v0.1 batch limit (1000 devices)', 413);
+          ensure(devices.length <= 10000, 'Target exceeds the 10000-device per-message safety limit', 413);
           const messageId = randomUUID();
-          db.prepare(`INSERT INTO messages(id,project_id,title,body,data_json,scheduled_at,created_at,idempotency_key,request_hash)
-            VALUES(?,?,?,?,?,?,?,?,?)`).run(messageId, match[1], input.title, input.body, JSON.stringify(input.data),
+          db.prepare(`INSERT INTO messages(id,project_id,title,body,data_json,options_json,scheduled_at,created_at,idempotency_key,request_hash)
+            VALUES(?,?,?,?,?,?,?,?,?,?)`).run(messageId, match[1], input.title, input.body, JSON.stringify(input.data), JSON.stringify(input.options),
               input.scheduledAt, clock(), idem ?? null, requestHash);
           const insert = db.prepare('INSERT INTO deliveries(message_id,device_id,next_attempt) VALUES(?,?,?)');
           for (const device of devices) insert.run(messageId, device.id, Math.max(input.scheduledAt, clock()));

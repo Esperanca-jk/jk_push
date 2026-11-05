@@ -21,8 +21,8 @@ export function createWorker({ db, masterKey, mock = false, transports = {}, now
       for (let i = 0; i < max; i++) {
         const row = transaction(db, () => {
           const due = db.prepare(`SELECT d.id, d.attempts, d.device_id,
-            v.platform, v.token_cipher, v.environment, v.enabled,
-            m.title, m.body, m.data_json, p.credentials
+            v.platform, v.token_cipher, v.token_hash, v.environment, v.enabled,
+            m.title, m.body, m.data_json, m.options_json, m.scheduled_at, p.credentials
             FROM deliveries d
             JOIN devices v ON v.id=d.device_id
             JOIN messages m ON m.id=d.message_id
@@ -36,7 +36,10 @@ export function createWorker({ db, masterKey, mock = false, transports = {}, now
         if (!row) break;
         handled++;
         let result;
-        if (!row.enabled) result = { ok: false, retry: false, error: 'Device disabled' };
+        const options = JSON.parse(row.options_json || '{}');
+        if (options.ttlSeconds > 0 && now() > row.scheduled_at + options.ttlSeconds * 1000) {
+          result = { ok: false, expired: true, retry: false, error: 'Notification TTL expired' };
+        } else if (!row.enabled) result = { ok: false, retry: false, error: 'Device disabled' };
         else {
           try {
             const device = { platform: row.platform, environment: row.environment, token: decrypt(row.token_cipher, masterKey) };
@@ -47,14 +50,14 @@ export function createWorker({ db, masterKey, mock = false, transports = {}, now
         }
         transaction(db, () => {
           const attempts = row.attempts + 1;
-          let status = result.ok ? 'accepted' : 'failed';
+          let status = result.ok ? 'accepted' : result.expired ? 'expired' : 'failed';
           if (!result.ok && result.retry && attempts < 5) status = 'queued';
           const delayMs = Math.min(3600, 5 * Math.pow(2, attempts)) * 1000;
           db.prepare(`UPDATE deliveries SET status=?, attempts=?, next_attempt=?, last_error=?, provider_id=? WHERE id=?`)
             .run(status, attempts, status === 'queued' ? now() + delayMs : now(),
               result.ok ? null : String(result.error ?? 'Provider rejected request').slice(0,180),
               result.ok ? String(result.providerId ?? '').slice(0,160) : null, row.id);
-          if (result.invalid) db.prepare('UPDATE devices SET enabled=0 WHERE id=?').run(row.device_id);
+          if (result.invalid) db.prepare('UPDATE devices SET enabled=0 WHERE id=? AND token_hash=?').run(row.device_id, row.token_hash);
         });
       }
     } finally { running = false; }

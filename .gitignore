@@ -9,3 +9,6 @@ node_modules/
 coverage/
 *.p8
 *service-account*.json
+*.p12
+*.mobileprovision
+*.key

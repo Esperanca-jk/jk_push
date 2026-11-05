@@ -1,100 +1,102 @@
 # JK Push
 
-**Native mobile push notifications with no service subscription.** A lightweight self-hosted REST API and dashboard that sends directly to **Apple Push Notification service (APNs)** and **Firebase Cloud Messaging (FCM HTTP v1)**.
+**A self-hosted native push notification platform for iOS and Android.** Build an operator console, register devices, target audiences, schedule messages and send through **APNs** and **FCM HTTP v1** — without a per-user or per-message software subscription.
 
-> **Project status: v0.1 technical preview.** This version is suitable for local evaluation and controlled pilots. It has unit/integration coverage and a mock provider mode, but has **not** been validated with live Apple/Google accounts at production scale. Do not interpret provider acceptance as guaranteed device delivery.
+[Quick start](#quick-start) · [API reference](docs/API.md) · [Provider setup](docs/PROVIDERS.md) · [Deployment](docs/DEPLOYMENT.md) · [Security](docs/SECURITY.md)
 
-## Why JK Push?
+> **Release: v0.2.0 (beta).** The API, local queue, migrations and provider payloads have automated tests. Live APNs/FCM delivery and large-scale operating characteristics still require validation with real accounts and devices before production use. Provider acceptance does **not** mean the notification was displayed or opened.
 
-- 🟢 **No per-message / per-user license fees**; MIT-licensed code.
-- 📱 **Real native push tokens**, not Expo Push Service tokens.
-- 🧱 **Multi-project** API with isolated server keys.
-- 🔐 Encrypted provider credentials and device tokens at rest (AES-256-GCM).
-- ⏰ Scheduled messages, cancellation of queued sends, persistent queue, bounded retries, idempotency keys.
-- 🎯 All devices, a user list, installation IDs, topic subscriptions, optional locale targeting.
-- 🖥️ Minimal browser dashboard and optional Expo integration helper.
-- 🧪 Mock mode for development without sending a single real notification.
-- ⚙️ SQLite persistence and **zero npm runtime dependencies** (Node.js built-ins only).
+## Features
 
-## Architecture
+| Capability | Status |
+| --- | --- |
+| Native APNs HTTP/2 delivery and FCM HTTP v1 | Implemented; live credentials required |
+| Multi-project isolation, one-time server keys and key rotation | Implemented |
+| Short-lived, user-scoped device registration tokens | Implemented |
+| Encrypted device tokens and provider private keys at rest | Implemented (AES-256-GCM) |
+| Expo / React Native integration helper | Source example, not an npm package |
+| Node.js backend SDK | Included (`sdk/server.mjs`) |
+| Target all, users, installations or topics; optional locale/platform filters | Implemented |
+| Notification options: priority, TTL, collapse key, iOS badge/sound, Android channel | Implemented |
+| Schedule, cancel queued sends, retry temporary errors, idempotency | Implemented |
+| Local SQLite queue with crash recovery | Implemented (single worker process) |
+| Dashboard, counts, campaign list, provider configuration status, device list | Implemented |
+| Remove user devices / delete projects and stored provider credentials | Implemented |
+| Background notifications, opened/delivered analytics, high-availability clusters | Not implemented |
 
-```text
-Your backend ──────── REST API ──────── SQLite queue ────── worker
-      │                   │                                  │
-      │            project server key                        ├─ APNs HTTP/2 → iOS
-      │                   │                                  └─ FCM HTTP v1 → Android
-      ▼                   ▼
-short-lived token      dashboard
-      │
-Expo / native client ── device registration (native token)
-```
+## Quick start
 
-## Requirements
-
-- **Node.js 22.13+** with `node:sqlite`. Node.js 22 currently warns that SQLite is experimental. Pin and test your runtime when upgrading.
-- An Apple Developer account and APNs `.p8` key for iOS distribution.
-- A Firebase project and service-account credentials with FCM permissions for Android.
-- Your own server, workstation or VPS (hosting and networking are **not** necessarily free).
-
-FCM Cloud Messaging has no usage charge under the official Firebase price list. Apple does not charge per APNs message, but app distribution may require a paid Developer Program membership. Delivery remains subject to provider policies and limits.
-
-## Start locally (mock mode)
+**Requirements:** Node.js 22.13+ (`node:sqlite`), a terminal and a browser. No npm packages are required to run the server or tests.
 
 ```bash
-# Generate two different secure random values:
-node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
-node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
-
-# Windows PowerShell (enter your own generated values):
-$env:MASTER_KEY = 'YOUR_FIRST_RANDOM_VALUE'
-$env:ADMIN_KEY = 'YOUR_SECOND_RANDOM_VALUE'
-$env:MOCK_DELIVERY = '1'
+git clone https://github.com/Esperanca-jk/jk_push.git
+cd jk_push
+npm run init
 npm start
 ```
 
-Open **http://127.0.0.1:8787/dashboard**. Enter `ADMIN_KEY`, create a project, and save the server API key shown once. For a reproducible API walkthrough, see [docs/API.md](docs/API.md).
+`npm run init` creates an ignored `.env` with unique, cryptographically random `ADMIN_KEY` and `MASTER_KEY`, enables **mock delivery**, and will refuse to overwrite an existing `.env`. The private keys are required to decrypt persisted data, so **back up `MASTER_KEY` securely**.
 
-### Linux / macOS
+Open **http://127.0.0.1:8787/dashboard** and paste `ADMIN_KEY` from your local `.env` file. Create a project, then save the newly generated `jk_sk_...` project server key; it is shown once. The app is bound to localhost by default.
 
-```bash
-export MASTER_KEY='YOUR_FIRST_RANDOM_VALUE'
-export ADMIN_KEY='YOUR_SECOND_RANDOM_VALUE'
-export MOCK_DELIVERY=1
-npm start
+In mock mode you can test the entire queue without contacting Apple/Google or consuming API quotas. Device registration requires a native-looking token and a short-lived registration ticket; [the API walkthrough](docs/API.md) shows how to create both.
+
+### Send a message from your backend
+
+```javascript
+import { createJkPushClient } from './sdk/server.mjs';
+
+const push = createJkPushClient({
+  baseUrl: 'http://127.0.0.1:8787',
+  projectId: process.env.JK_PUSH_PROJECT_ID,
+  apiKey: process.env.JK_PUSH_SERVER_KEY
+});
+
+const queued = await push.send({
+  title: 'A new update',
+  body: 'Your dashboard is ready',
+  data: { screen: 'updates' },
+  target: { userIds: ['user-123'] },
+  options: { ttlSeconds: 3600, priority: 'normal' }
+}, 'unique-business-event-123');
+console.log(queued.messageId);
 ```
 
-To use real APNs/FCM, stop the server, remove `MOCK_DELIVERY=1`, configure per-project provider credentials through the admin API, and restart the service. The dashboard does not currently edit credentials.
+Keep `JK_PUSH_SERVER_KEY` on your **trusted backend**, never in mobile applications. Your backend authenticates users, obtains a 10-minute registration ticket, and passes only that ticket to the app. See [Expo registration](examples/expo-registration.md).
 
-## Development
+## Enable real native delivery
+
+After verifying mock mode, configure the APNs `.p8` key and/or Firebase service-account JSON for each project through the **admin-only** credential API; both require their associated app-side entitlements and configuration. Set `MOCK_DELIVERY=0` and restart the server.
+
+- Apple iOS: Team ID, Key ID, bundle identifier, APNs Auth Key, iOS push entitlement, and Apple development/distribution configuration.
+- Google Android: Firebase project, service-account credential authorized for FCM, Android app configured with Firebase and notification permission/channel.
+- The service sends directly to the providers; it does **not** use Expo Push Service tokens.
+
+Read [PROVIDERS.md](docs/PROVIDERS.md) for field-by-field setup.
+
+## Operation
 
 ```bash
 npm test
 npm run check
+npm start
 ```
 
-Tests use an in-memory SQLite database, a mock transport and HTTP-level assertions. **No cloud API, external service or GitHub Actions minutes are used.** No workflow files are included.
+The server keeps notification state in SQLite. The worker polls every two seconds and retries transient failures (at most five attempts). Each message is capped at **10,000 queued recipients** as a single-process safety guard; it is not a hosted-plan quota. A deployment with more recipients needs partitioned campaigns and capacity testing. Delivery is **at least once** under crashes; duplicates can occur.
 
-## Production warnings
+For Docker Compose, persistent backups, TLS reverse proxies, production configuration and troubleshooting, read [DEPLOYMENT.md](docs/DEPLOYMENT.md). This repository intentionally does not install GitHub Actions workflows or schedule CI jobs. Local tests use mock transports and no external services.
 
-1. **HTTPS is mandatory** when accessible from outside your machine. Bind locally and put a TLS reverse proxy in front; do not expose the default HTTP listener on the public internet.
-2. **Server keys stay on your trusted backend.** Never ship your `ADMIN_KEY`, `MASTER_KEY`, project server key, `.p8` or Google service-account JSON in a mobile app.
-3. **Protect database backups.** Keep the `MASTER_KEY` safe and back it up separately: encrypted tokens and provider keys cannot be recovered without it.
-4. **One process / one writable SQLite database** is the supported deployment model. This is not yet a distributed queue or high-availability service. Sudden termination can cause a provider send to be retried once; push delivery is at-least-once, not exactly-once.
-5. **Rate limiting** is per remote IP and in-memory; for internet-facing deployments add a trusted reverse proxy / WAF and enforce account limits.
-6. **No open signup or multi-tenant billing** is included. Projects are created by a trusted administrator.
-7. **Device consent and data privacy** remain your responsibility. Implement privacy disclosures, retention, backups, and user deletion policies appropriate for your jurisdiction.
-8. **Native app configuration is required.** Installing this server alone will not enable push entitlements, Firebase configuration, notification permissions or Android channels.
+## Cost model
 
-## Roadmap
+JK Push is licensed under **MIT** and has no built-in service fee, paid tiers or recipient charges. You are responsible for hosting/storage/network costs, Apple Developer Program fees where applicable, security, and provider terms and rate limits. Operating a hosted service for others will have costs even though the software is free.
 
-User preferences/quiet hours, more detailed campaign analytics, proper audit logging, optional Postgres/Redis scale-out, hosted SaaS onboarding, and native Swift/Kotlin SDK packaging. These are **planned**, not shipped in v0.1.
+## Security and privacy
 
-## Docs
+- Passwords, provider credentials, API keys and device tokens are not exposed through the public device-list API.
+- AES-256-GCM encryption protects credentials and native tokens **at rest**; use HTTPS and a trusted reverse proxy for any external access.
+- Device registration is user-scoped; never expose project server keys, `ADMIN_KEY`, `MASTER_KEY`, APNs keys or Firebase service accounts to client apps.
+- You remain responsible for push consent, user rights, data retention, deletion policies and compliance with local laws.
 
-- [REST API](docs/API.md)
-- [Security model](docs/SECURITY.md)
-- [Expo integration](examples/expo-registration.md)
-- [Contributing](CONTRIBUTING.md)
-- [License](LICENSE)
+See [SECURITY.md](docs/SECURITY.md) for risks and [CONTRIBUTING.md](CONTRIBUTING.md) to contribute.
 
-© 2026 Umut Öztosun — MIT License.
+© 2026 Umut Öztosun. [MIT License](LICENSE).

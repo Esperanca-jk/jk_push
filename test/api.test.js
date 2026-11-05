@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomKey, readMasterKey } from '../src/crypto.js';
+import { generateKeyPairSync } from 'node:crypto';
 import { openDatabase } from '../src/db.js';
 import { createApi } from '../src/api.js';
 import { createWorker } from '../src/worker.js';
@@ -75,11 +76,13 @@ test('scheduled notification waits for due time', async () => root(async ({ requ
 test('credentials require admin auth and ciphertext storage', async () => root(async ({ request, adminKey, db }) => {
   const { data: p } = await request('POST', '/v1/admin/projects', adminKey, { name: 'Secure Store' });
   const path = `/v1/admin/projects/${p.projectId}/credentials`;
-  const fake = { fcm: { projectId: 'test-project', clientEmail: 'abc@test-project.iam.gserviceaccount.com', privateKey: '-----BEGIN PRIVATE KEY-----\nNOT-REAL\n-----END PRIVATE KEY-----' } };
+  const pair = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const pem = pair.privateKey.export({ type: 'pkcs8', format: 'pem' });
+  const fake = { fcm: { projectId: 'test-project', clientEmail: 'abc@test-project.iam.gserviceaccount.com', privateKey: pem } };
   assert.equal((await request('PUT', path, p.apiKey, fake)).status, 401);
   assert.equal((await request('PUT', path, adminKey, fake)).status, 200);
   const value = db.prepare('SELECT credentials FROM projects WHERE id=?').get(p.projectId).credentials;
-  assert.equal(value.includes('NOT-REAL'), false);
+  assert.equal(value.includes(pem), false);
 }));
 
 test('cancel scheduled messages, fetch stats and rotate API key', async () => root(async ({ request, adminKey, db }) => {
@@ -114,4 +117,71 @@ test('installation cannot be reassigned to a different user', async () => root(a
   assert.equal(db.prepare('SELECT user_id FROM devices WHERE project_id=? AND installation_id=?')
     .get(p.projectId, 'install-123').user_id, 'user-a');
   assert.equal((await request('POST', rootPath + '/devices', a.data.token, { ...device, token: 'c'.repeat(64) })).status, 200);
+}));
+
+test('device list is paginated, excludes secrets, supports deletion by user ID', async () => root(async ({ request, adminKey, db, worker }) => {
+  const { data: p } = await request('POST', '/v1/admin/projects', adminKey, { name: 'Device Manager' });
+  const route = `/v1/projects/${p.projectId}`;
+  for (let i = 0; i < 3; i++) {
+    const userId = i === 2 ? 'second:user@example.com' : 'first:user@example.com';
+    const ticket = await request('POST', route + '/registration-tokens', p.apiKey, { userId });
+    const saved = await request('POST', route + '/devices', ticket.data.token, {
+      installationId: `phone${i}`, platform: i === 2 ? 'ios' : 'android',
+      token: i === 2 ? 'a'.repeat(64) : `long-native-token-${i}-abcdef`, locale: 'en-US'
+    });
+    assert.equal(saved.status, 200);
+  }
+  const page1 = await request('GET', route + '/devices?limit=2', p.apiKey);
+  assert.equal(page1.data.devices.length, 2);
+  assert.ok(page1.data.nextCursor);
+  assert.equal(JSON.stringify(page1.data).includes('token_cipher'), false);
+  assert.equal(JSON.stringify(page1.data).includes('long-native-token'), false);
+  const page2 = await request('GET', route + '/devices?limit=2&after=' + page1.data.nextCursor, p.apiKey);
+  assert.equal(page2.data.devices.length, 1);
+  assert.equal(page2.data.nextCursor, null);
+  assert.equal((await request('GET', route + '/devices?limit=101', p.apiKey)).status, 400);
+  const msg = await request('POST', route + '/messages', p.apiKey, {
+    title: 'Hi', body: 'News', target: { userIds: ['first:user@example.com'], platform: 'android' },
+    options: { badge: 3, ttlSeconds: 300, priority: 'normal', collapseKey: 'updates' }
+  });
+  assert.equal(msg.data.queued, 2);
+  const row = db.prepare('SELECT options_json FROM messages WHERE id=?').get(msg.data.messageId);
+  assert.equal(JSON.parse(row.options_json).badge, 3);
+  const deleted = await request('DELETE', route + '/users/first:user@example.com', p.apiKey);
+  assert.equal(deleted.data.removedDevices, 2);
+  assert.equal((await request('GET', route + '/stats', p.apiKey)).data.activeDevices, 1);
+  assert.equal(await worker.tick(), 0);
+}));
+
+test('admin can inspect and remove provider credentials and delete confirmed project', async () => root(async ({ request, adminKey }) => {
+  const { data: p } = await request('POST', '/v1/admin/projects', adminKey, { name: 'Lifecycle App' });
+  const base = `/v1/admin/projects/${p.projectId}`;
+  assert.equal((await request('GET', base + '/providers', adminKey)).data.fcmConfigured, false);
+  const invalid = { apns: { teamId: 'ABCDEFGHIJ', keyId: 'ABCDEFGHIJ', bundleId: 'com.example.app',
+    privateKey: '-----BEGIN PRIVATE KEY-----\ninvalid\n-----END PRIVATE KEY-----' } };
+  assert.equal((await request('PUT', base + '/credentials', adminKey, invalid)).status, 400);
+  const ec = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const valid = { ...invalid, apns: { ...invalid.apns, privateKey: ec.privateKey.export({ type: 'pkcs8', format: 'pem' }) } };
+  assert.equal((await request('PUT', base + '/credentials', adminKey, valid)).status, 200);
+  assert.equal((await request('GET', base + '/providers', adminKey)).data.apnsConfigured, true);
+  assert.equal((await request('DELETE', base + '/credentials/apns', adminKey)).data.apnsConfigured, false);
+  assert.equal((await request('DELETE', base, adminKey)).status, 400);
+  assert.equal((await request('DELETE', base, adminKey, undefined, { 'x-confirm-delete': p.projectId })).status, 200);
+  assert.equal((await request('GET', base + '/providers', adminKey)).status, 404);
+}));
+
+test('same native push token cannot be assigned to two different users', async () => root(async ({ request, adminKey, db }) => {
+  const { data: p } = await request('POST', '/v1/admin/projects', adminKey, { name: 'Push Token Ownership' });
+  const route = `/v1/projects/${p.projectId}`;
+  const user1 = (await request('POST', route + '/registration-tokens', p.apiKey, { userId: 'user1' })).data.token;
+  const user2 = (await request('POST', route + '/registration-tokens', p.apiKey, { userId: 'user2' })).data.token;
+  const token = 'an-android-native-token-that-is-shared';
+  assert.equal((await request('POST', route + '/devices', user1,
+    { installationId: 'phone1', platform: 'android', token })).status, 200);
+  assert.equal((await request('POST', route + '/devices', user2,
+    { installationId: 'phone2', platform: 'android', token })).status, 409);
+  assert.equal((await request('POST', route + '/devices', user1,
+    { installationId: 'phone3', platform: 'android', token })).status, 200);
+  const devices = db.prepare('SELECT installation_id FROM devices WHERE project_id=?').all(p.projectId);
+  assert.deepEqual(devices.map(d => d.installation_id), ['phone3']);
 }));

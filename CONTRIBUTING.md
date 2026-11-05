@@ -1,11 +1,11 @@
 # Contributing to JK Push
 
-Thanks for contributing. The most useful contributions are reproducible fixes, platform-specific tests, and documentation that helps developers use APNs / FCM correctly.
+Bug reports, platform-specific tests, documentation and focused improvements are welcome. The most useful contributions include real-world APNs and FCM interoperability test results, false-positive analysis, minimal failing fixtures and SDK examples.
 
-## Development
+## Local development
 
-Use Node.js 22.13+ and run `npm test` and `npm run check`. A real Apple or Firebase account is **not** required to run the tests; the integration suite uses a fake provider transport.
+Use Node.js 22.13+. Run `npm test` and `npm run check` before opening a pull request. Tests use an in-memory SQLite database and mock transports; no Apple or Firebase account is required. Never upload actual signing keys, service-account JSON, production device tokens or confidential user data in issues or PRs.
 
-Please make PRs narrowly scoped. Include a failing test for a bug fix and no secrets, private logs or user push tokens in test fixtures. Keep APNs and FCM request handling independent and avoid accidentally retrying permanent errors. New features should document migration, security, and privacy impact.
+For provider changes, add test coverage for header construction, auth errors, retryability and invalid-token handling. For database changes, add a migration test and document backup/rollback considerations. Keep security and privacy impact explicit in PR descriptions.
 
-There are intentionally **no GitHub Actions workflows**; CI is run manually or within the contributor's own environment.
+There are deliberately **no GitHub Actions workflows** in this repository. Contributors can test locally without consuming someone else's Actions minutes.

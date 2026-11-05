@@ -1,4 +1,4 @@
-import { sign } from 'node:crypto';
+import { createHash, sign } from 'node:crypto';
 
 const tokens = new Map();
 const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -12,7 +12,8 @@ export function makeGoogleAssertion(config, nowSeconds = Math.floor(Date.now() /
 }
 
 async function accessToken(config) {
-  const key = config.clientEmail + ':' + config.projectId;
+  const fingerprint = createHash('sha256').update(config.privateKey).digest('hex');
+  const key = `${config.clientEmail}:${config.projectId}:${fingerprint}`;
   const cached = tokens.get(key);
   if (cached && cached.expires > Date.now()) return cached.token;
   const assertion = makeGoogleAssertion(config);
@@ -29,7 +30,27 @@ async function accessToken(config) {
   const data = await response.json();
   if (!data.access_token) throw new Error('Google OAuth response had no access token');
   tokens.set(key, { token: data.access_token, expires: Date.now() + Math.max(0, Number(data.expires_in ?? 3600) - 120) * 1000 });
+  if (tokens.size > 100) tokens.clear();
   return data.access_token;
+}
+
+export function buildFcmMessage(device, message) {
+  const options = JSON.parse(message.options_json || '{}');
+  const android = {
+    priority: options.priority === 'normal' ? 'NORMAL' : 'HIGH',
+    ttl: `${options.ttlSeconds ?? 86400}s`
+  };
+  if (options.collapseKey) android.collapse_key = options.collapseKey;
+  if (options.channelId || options.sound) {
+    android.notification = {};
+    if (options.channelId) android.notification.channel_id = options.channelId;
+    if (options.sound) android.notification.sound = options.sound;
+  }
+  return { message: {
+    token: device.token,
+    notification: { title: message.title, body: message.body },
+    data: JSON.parse(message.data_json || '{}'), android
+  } };
 }
 
 export async function sendFcm(config, device, message) {
@@ -41,18 +62,18 @@ export async function sendFcm(config, device, message) {
     const response = await fetch('https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(config.projectId) + '/messages:send', {
       method: 'POST', signal: AbortSignal.timeout(10_000),
       headers: { authorization: 'Bearer ' + oauth, 'content-type': 'application/json' },
-      body: JSON.stringify({ message: { token: device.token,
-        notification: { title: message.title, body: message.body }, data: JSON.parse(message.data_json) } })
+      body: JSON.stringify(buildFcmMessage(device, message))
     });
     const result = await response.json().catch(() => ({}));
     if (response.ok) return { ok: true, providerId: result.name ?? null };
     const codes = (result.error?.details ?? []).map(detail => detail.errorCode).filter(Boolean);
-    const invalid = codes.includes('UNREGISTERED');
     const reason = codes[0] ?? result.error?.status ?? 'UNKNOWN';
+    // FCM INVALID_ARGUMENT may indicate an invalid payload, not an invalid device.
+    const invalid = reason === 'UNREGISTERED';
     return { ok: false, retry: response.status === 429 || response.status >= 500,
       invalid, error: 'FCM ' + response.status + ': ' + reason };
   } catch (error) {
     return { ok: false, retry: error.retry !== false,
-      error: 'FCM network or authentication failure: ' + (error.code ?? error.message).slice(0,120) };
+      error: 'FCM network or authentication failure: ' + (error.code ?? error.message ?? 'unknown').slice(0,120) };
   }
 }

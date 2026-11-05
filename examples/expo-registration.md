@@ -1,19 +1,19 @@
-# Expo / React Native integration
+# Expo / React Native native push registration
 
-Use a **development or production build**, not Expo Go. Configure `expo-notifications` and the Firebase Android configuration; iOS requires the push notification entitlement.
+This example uses **APNs** on iOS and **FCM** on Android, not the Expo Push Service. Use a development build or store build, not Expo Go. Configure `expo-notifications`, iOS push entitlements and Android Firebase before continuing.
 
 ```bash
 npx expo install expo-notifications expo-secure-store expo-crypto
 ```
 
-Persist an installation ID securely. The following helper is an example and needs to be imported from your application code:
+Copy [`sdk/expo.ts`](../sdk/expo.ts) into your mobile project (for example `src/lib/jk_push-expo.ts`), then call it after your application user has signed in.
 
 ```typescript
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { registerExpoDevice } from './jk_push-expo';
+import { registerExpoDevice, watchExpoPushTokenChanges, unregisterExpoDevice } from './lib/jk_push-expo';
 
-async function installationId() {
+async function installationId(): Promise<string> {
   let id = await SecureStore.getItemAsync('jk_push-installation-id');
   if (!id) {
     id = Crypto.randomUUID();
@@ -22,24 +22,36 @@ async function installationId() {
   return id;
 }
 
-async function enableNotifications() {
-  // YOUR backend validates the signed-in user and issues a short-lived token
-  // using JK Push's POST /v1/projects/:id/registration-tokens endpoint.
+async function getOptions() {
+  // YOUR backend verifies the signed-in user and uses its private JK Push server key.
   const response = await fetch('https://my-backend.example.com/notifications/registration-token', {
     headers: { Authorization: 'Bearer <your-app-login-token>' }
   });
   if (!response.ok) throw new Error('Authentication required');
   const { token, projectId } = await response.json();
-  return registerExpoDevice({
+  return {
     serverUrl: 'https://push.example.com',
     projectId,
     registrationToken: token,
     installationId: await installationId(),
-    apnsEnvironment: 'production'
-  });
+    apnsEnvironment: 'production' as const,
+    androidChannelId: 'default',
+    locale: 'en-US'
+  };
 }
+
+// After login:
+const options = await getOptions();
+await registerExpoDevice(options);
+
+// Keep this listener active while signed in. On token rotation it requests a fresh ticket.
+const listener = watchExpoPushTokenChanges(getOptions, console.error);
+
+// On logout, ideally before revoking your app's own authentication:
+await unregisterExpoDevice(await getOptions());
+listener.remove();
 ```
 
-Set `apnsEnvironment` to `sandbox` if your APNs token belongs to an Apple development build. In production it should normally be `production`. Update the stored push token after rotation (Expo exposes `Notifications.addPushTokenListener`). The receiving app must handle notification press events, Android channels, permission revocation, and in-app navigation itself.
+When switching accounts on a shared phone, unregister the old installation **before** registering under the new user. The server rejects reassigning an existing installation ID to another user to prevent account hijacking. If the old user cannot unregister, have your trusted backend delete the previous user's device records through `DELETE /v1/projects/{projectId}/users/{userId}` after validating the request.
 
-**Important:** This client helper is only a source file. It is not an installed npm package yet. Copy `sdk/expo.ts` into your Expo app and update the import path.
+Register the app's notification press/foreground handlers and handle Android notification channels and app navigation. The helper does not automatically manage received pushes or notification opening. Read [Expo's official notification guide](https://docs.expo.dev/versions/latest/sdk/notifications/).

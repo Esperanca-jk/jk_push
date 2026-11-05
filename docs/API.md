@@ -1,22 +1,25 @@
-# REST API reference
+# REST API
 
-Use `Authorization: Bearer ...` on all protected endpoints and `Content-Type: application/json` for requests with a body. Commands below use `curl` examples; replace placeholders.
+Base URL: `http://127.0.0.1:8787` locally, or your HTTPS origin in production. Protected endpoints require `Authorization: Bearer <key>`. JSON write endpoints require `Content-Type: application/json`; request body limit is 64 KiB. The JSON responses use `Cache-Control: no-store`.
 
-## 1. Create project — admin only
+Use **admin** credentials only for project/credential management, **project server** credentials for messages/topics and issuing registration tickets, and **short-lived registration tokens** from mobile clients.
 
-```bash
-curl -sS http://127.0.0.1:8787/v1/admin/projects \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer $ADMIN_KEY" \
-  -d '{"name":"My App"}'
-```
+## Admin routes
 
-Response: `projectId` and **one-time** `apiKey` (starts with `jk_sk_`). Put the key only on your trusted application backend.
+| Method | Route | Description |
+| --- | --- | --- |
+| `POST` | `/v1/admin/projects` | Create a project: `{ "name": "Demo" }`. Returns `projectId` and one-time `apiKey` |
+| `GET` | `/v1/admin/projects` | List projects and number of devices |
+| `POST` | `/v1/admin/projects/{projectId}/rotate-key` | Revoke server key and issue a new one |
+| `PUT` | `/v1/admin/projects/{projectId}/credentials` | Save or replace APNs/FCM provider credentials |
+| `GET` | `/v1/admin/projects/{projectId}/providers` | See if APNs/FCM credentials are configured (no secrets) |
+| `DELETE` | `/v1/admin/projects/{projectId}/credentials/apns` | Remove APNs credentials |
+| `DELETE` | `/v1/admin/projects/{projectId}/credentials/fcm` | Remove FCM credentials |
+| `DELETE` | `/v1/admin/projects/{projectId}` | Permanently delete project and all related records; **requires `X-Confirm-Delete: {projectId}`** |
 
-`GET /v1/admin/projects` lists projects (no keys). `POST /v1/admin/projects/{projectId}/rotate-key` revokes the old project key and returns a replacement **once** (admin only). `GET /health` returns readiness.
+### Provider credentials
 
-## 2. Add provider credentials — admin only
-
-`PUT /v1/admin/projects/{projectId}/credentials`
+`PUT /v1/admin/projects/{projectId}/credentials` accepts either or both of these objects:
 
 ```json
 {
@@ -24,90 +27,100 @@ Response: `projectId` and **one-time** `apiKey` (starts with `jk_sk_`). Put the 
     "teamId": "ABCDEFGHIJ",
     "keyId": "ABCDEFGHIJ",
     "bundleId": "com.example.app",
-    "privateKey": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+    "privateKey": "-----BEGIN PRIVATE KEY-----\n...real P-256 key...\n-----END PRIVATE KEY-----"
   },
   "fcm": {
     "projectId": "your-firebase-project",
     "clientEmail": "example@your-firebase-project.iam.gserviceaccount.com",
-    "privateKey": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+    "privateKey": "-----BEGIN PRIVATE KEY-----\n...real RSA key...\n-----END PRIVATE KEY-----"
   }
 }
 ```
 
-You may provide only `apns` or only `fcm`; the other saved provider is retained. Values are encrypted on disk. Never commit credentials. Send secrets only over HTTPS when remote.
+Keys are checked for type and syntax, encrypted on disk and never returned. A successful credential save does not prove that Apple/Google will accept the account permissions or topic identifiers. Use [provider setup](PROVIDERS.md) and test on real devices.
 
-## 3. Issue a registration token — trusted application backend
+## Project routes
 
-`POST /v1/projects/{projectId}/registration-tokens` with project server API key:
+All routes below start with `/v1/projects/{projectId}` and require a **project server key** unless explicitly marked *registration token*.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/registration-tokens` | `{ "userId": "user-123" }` → signed device registration token, expires in 600 sec |
+| `POST` | `/devices` | **Registration token**: register/update a device |
+| `DELETE` | `/devices/{installationId}` | **Registration token**: remove own device |
+| `GET` | `/devices?after=0&limit=50` | List devices without push tokens, up to 100 per page; response includes `nextCursor` |
+| `DELETE` | `/users/{userId}` | Remove all devices and topic memberships for a user (server-side privacy action) |
+| `POST` | `/topics` | Subscribe/unsubscribe an installation to a topic |
+| `POST` | `/messages` | Queue a notification |
+| `GET` | `/messages` | List 50 most recent notifications |
+| `GET` | `/messages/{messageId}` | Message with delivery-state counts |
+| `POST` | `/messages/{messageId}/cancel` | Cancel remaining queued deliveries |
+| `GET` | `/stats` | Active devices, campaign counts, delivery-state totals |
+
+### Device registration
+
+The **trusted application backend** must authenticate the user, then request a registration ticket using its project key:
 
 ```json
-{ "userId": "user-123" }
+{ "userId": "user:123@example.com" }
 ```
 
-Returns `token`, `expiresIn: 600`. Only your authenticated application backend should call this endpoint. It must verify the end user's identity before requesting the token. The short-lived token is scoped to the project and user ID.
-
-## 4. Register native device — mobile app
-
-`POST /v1/projects/{projectId}/devices` with **registration token**, not project API key:
+Pass only the returned 10-minute ticket to the client app. The app calls `POST /devices` with the ticket and a native token:
 
 ```json
 {
   "installationId": "install_abc123",
   "platform": "ios",
-  "token": "<native APNs hex token>",
+  "token": "<real native APNs hex token>",
   "environment": "production",
   "locale": "en-US"
 }
 ```
 
-For Android, use platform `android` and a native FCM token. Clients can remove their registration via `DELETE /v1/projects/{projectId}/devices/{installationId}` with a valid registration token for the same user ID. Devices are upserted on token rotation.
+For Android use `platform: android` and a native FCM token. The same installation ID cannot be claimed by a different user until it is unregistered; unregister devices on logout. Client token refresh is a re-registration.
 
-## 5. Subscribe device to a topic — trusted backend
+### Subscribe to a topic
 
-`POST /v1/projects/{projectId}/topics` with project server key:
+Send from your **trusted backend** (not directly from an untrusted app):
 
 ```json
 { "installationId": "install_abc123", "topic": "news", "subscribed": true }
 ```
 
-Set `subscribed: false` to remove the subscription. Do not treat topics as security/authorization: this API trusts your application backend to decide membership.
+Set `subscribed` to `false` to unsubscribe. Topic membership should be authorization-checked by your backend.
 
-## 6. Queue a message — trusted backend
+### Create notification
 
-`POST /v1/projects/{projectId}/messages` with project server key:
+`POST /messages` example:
 
 ```json
 {
   "title": "Weekly update",
   "body": "New items are available.",
   "data": { "screen": "feed" },
-  "target": { "topic": "news", "locale": "en-US" },
-  "sendAt": "2026-11-07T10:00:00Z"
+  "target": { "topic": "news", "locale": "en-US", "platform": "android" },
+  "sendAt": "2026-11-07T10:00:00Z",
+  "options": {
+    "priority": "normal",
+    "ttlSeconds": 3600,
+    "collapseKey": "weekly-news",
+    "badge": 1,
+    "sound": "default",
+    "channelId": "updates"
+  }
 }
 ```
 
-Choose exactly one main target selector:
+Choose exactly one selector: `all: true`, `userIds: ["..."]`, `installationIds: ["..."]`, or `topic: "..."`. You may also filter by `locale` and `platform` (`ios`/`android`). `sendAt` is optional, but when used must be a timestamp with timezone. Device targeting is resolved when the message is queued, **not at the time it is sent**.
 
-- `{ "all": true }`
-- `{ "userIds": ["user-123", "user-456"] }`
-- `{ "installationIds": ["install_abc123"] }`
-- `{ "topic": "news" }`
+**Options** (optional): `priority` high/normal (default high); `ttlSeconds` 0–2419200 (default 86400); `collapseKey` (up to 64 characters); `badge` iOS integer; `sound` notification sound; `channelId` Android channel registered by the app. iOS ignores Android channel settings. Collapsing is controlled by APNs/FCM behavior and is not a server-side queue deduplication guarantee. A TTL of 0 requests immediate delivery only at the provider; it does not cancel a queued message before it is sent.
 
-Add `locale` to any selector. Omit `sendAt` to queue immediately. Each API request targets at most **1000 devices** in v0.1; larger requests return HTTP 413 rather than silently truncating results. Batch larger sends in your backend.
+The API rejects FCM-reserved data keys (including `aps`, `google.*`, `gcm*`). Custom data values must be strings. A single request can queue up to **10,000 devices**; split larger broadcasts into campaigns and capacity-test your own host. Max request JSON: 64 KiB.
 
-Set `Idempotency-Key: unique-request-id` to avoid duplicate queue insertion on network retry. Reusing a key with a different payload returns HTTP 409. The response includes `messageId` and `queued`.
+Set an `Idempotency-Key` header (6–128 characters, letters/numbers/`_`/`-`) on retriable requests. Same key + same payload returns the original `messageId`; using the same key for different payloads returns HTTP 409.
 
-`GET /v1/projects/{projectId}/messages` lists recent messages. `GET /v1/projects/{projectId}/messages/{messageId}` returns per-state counts (`queued`, `accepted`, `failed`, `canceled`). `POST /v1/projects/{projectId}/messages/{messageId}/cancel` cancels any **queued** deliveries; in-flight or provider-accepted notifications cannot be recalled. `GET /v1/projects/{projectId}/stats` reports active devices, campaigns, and delivery state totals.
+**Delivery states:** `queued`, `processing`, `accepted`, `failed`, `canceled`, `expired`. `accepted` means APNs or FCM accepted the HTTP request, **not** that the app displayed the notification. Pending jobs are canceled; already processing jobs may still complete. The worker retries transient errors with exponential backoff up to 5 attempts. Process crashes can lead to duplicate provider submissions.
 
-**Accepted** means APNs or FCM accepted the request, not that the user saw or opened the notification.
+## HTTP status codes
 
-## Status codes
-
-- `200`, `201`: success
-- `400`: validation error
-- `401`: incorrect or expired bearer token
-- `404`: unknown project, device, or message
-- `409`: idempotency conflict
-- `413`: oversized body or target list
-- `415`: expected JSON content type
-- `429`: per-IP rate limit
+`200`, `201` success; `400` invalid data; `401` wrong/expired token; `404` unknown resource; `409` ownership/idempotency conflict; `413` excessive body/recipients; `415` expected JSON content type; `429` per-IP rate limit; `500` internal server error (details logged on server only).

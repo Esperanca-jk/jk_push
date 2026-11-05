@@ -30,6 +30,7 @@ export function openDatabase(file = ':memory:') {
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       title TEXT NOT NULL, body TEXT NOT NULL, data_json TEXT NOT NULL,
+      options_json TEXT NOT NULL DEFAULT '{}',
       scheduled_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
       idempotency_key TEXT, request_hash TEXT,
       UNIQUE(project_id, idempotency_key)
@@ -44,6 +45,11 @@ export function openDatabase(file = ':memory:') {
     );
     CREATE INDEX IF NOT EXISTS deliveries_due_idx ON deliveries(status, next_attempt);
   `);
+  // Existing v0.1 installations are migrated in place without deleting their queue.
+  const columns = db.prepare('PRAGMA table_info(messages)').all().map(row => row.name);
+  if (!columns.includes('options_json')) {
+    db.exec("ALTER TABLE messages ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'");
+  }
   return db;
 }
 

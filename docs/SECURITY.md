@@ -1,28 +1,30 @@
-# Security model and limitations
+# JK Push security model
 
 ## Trust boundaries
 
-- `ADMIN_KEY` is the control-plane secret. Store it only on the server / with authorized operators.
-- Project API keys (`jk_sk_*`) are private **server-to-server** credentials and are stored as SHA-256 digests.
-- Device registration tickets are HMAC-SHA256 signed by the server, expire after 10 minutes, and identify a project plus authenticated user ID. The application backend must verify the user first.
-- APNs private keys, FCM service-account private keys and native device tokens are AES-256-GCM encrypted at rest with `MASTER_KEY`. Back up this master key separately and securely.
-- Token unregistration validates ownership by registration ticket user ID. Re-registering an existing installation ID under a different user is rejected (HTTP 409).
+- `ADMIN_KEY` is a highly privileged control-plane secret. Anyone with it can manage projects and provider credentials.
+- Project server keys (`jk_sk_*`) allow issuing device tickets, editing topics, sending notifications, deleting user devices and viewing project metadata. They are stored as SHA-256 digests and **must never be embedded in mobile applications**.
+- Device registration tokens expire after 10 minutes and are signed using HMAC-SHA256. They identify a trusted backend-authenticated user and a project, and are suitable only for short-lived device registration/unregistration. The application backend must first authenticate and authorize the user.
+- APNs/FCM private keys and device push tokens are stored encrypted with AES-256-GCM using `MASTER_KEY`. All recipients' native tokens remain hidden from the device-list API.
+- A device installation ID and native push token belong to one user at a time within a project. A conflicting attempt responds with 409, while duplicate installations under the same user/token are consolidated. Delete an old device before user switching.
 
-## Hardening before public deployment
+## Deployment checklist
 
-- Use a TLS reverse proxy with IP filtering, body limits, and per-project quotas. The default server binds to loopback.
-- Keep your host patched. Protect database files and backups with OS permissions. Avoid colocating untrusted workloads.
-- Rotate APNs/FCM credentials if exposed; changing MASTER_KEY currently requires re-encrypting stored secrets.
-- Maintain an allowlist for your application backend's routes that mint registration tickets. Require normal user authentication there.
-- Add abuse prevention to the device registration endpoint at the reverse proxy. A valid short-lived ticket can currently register multiple installations until expiry.
-- Rate limiting here is a single-process convenience, not a full distributed abuse-control system.
-- TLS termination, data retention, subject-access requests, export, moderation, and platform compliance are deployment responsibilities.
-- Never log raw bearer tokens, device tokens, .p8 keys, or provider service-account JSON.
+- Use HTTPS for all externally accessible endpoints. Bind the app to loopback and terminate TLS at a trusted reverse proxy. Consider admin access via VPN/allowlisted IPs.
+- Apply host-level firewall, reverse-proxy rate limiting and request-body limits. JK Push's in-memory per-IP quota is single-process convenience only and is insufficient for hostile public internet traffic.
+- Restrict `POST /registration-tokens` in **your app's own backend** to authenticated users. It must never let an arbitrary client request a ticket for any other user ID.
+- Back up the SQLite database and the `MASTER_KEY` separately. Restoring a DB without its key will not restore encrypted data. Master-key rotation is **not automatically supported** in v0.2; do not replace it without migrating encrypted records.
+- Log authentication failures/metadata only; never log credentials, bearer values, provider private keys or push tokens. The dashboard keeps secrets in memory and does not persist them in browser storage.
+- Use project-specific quotas, account billing and abuse monitoring externally if running a shared public SaaS. This release is a **self-hosted server for trusted operators**, not an open anonymous signup platform.
+- Comply with device opt-in, user access/delete rights, reasonable retention, regional rules, and Apple's and Google's platform requirements. There is no automatic retention/expiry purge for old campaign metadata in this release.
+- Keep Node.js and your host patched. Avoid untrusted plugins sharing the same process or filesystem.
 
-## Delivery guarantees
+## Delivery model
 
-The worker retries transient errors up to five attempts, with exponential backoff. APNs and FCM may accept pushes that are never displayed. A process crash after the provider accepts a push but before SQLite commits its result can cause duplicate delivery on recovery. Callers should design notifications to tolerate duplicates.
+A successful `accepted` status means APNs/FCM accepted a request, not that a device displayed or opened it. Device acceptance and opens require app-side instrumentation. Temporary provider failures are retried up to 5 times; permanent invalid device tokens are disabled. The worker avoids disabling a token that has been refreshed while the provider request was in flight.
 
-## Responsible disclosure
+The supported architecture is one writable SQLite database with one worker process. A crash after provider acceptance but before local acknowledgment may cause duplicate delivery. `Idempotency-Key` prevents duplicate API queueing for the same message, but not duplicate provider delivery after crash.
 
-Do not publish working exploit steps or private credentials in an issue. Please contact the maintainer privately through their GitHub profile before public disclosure.
+## Vulnerability reporting
+
+Please do not post secrets, private logs or working exploits publicly. Contact the repository maintainer privately using the contact information in their GitHub profile.
